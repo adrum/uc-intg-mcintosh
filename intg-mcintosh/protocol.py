@@ -16,10 +16,18 @@ Protocol notes, all verified against a real MX160:
 * At verbosity 2 the device echoes each command back as ``#CMD`` immediately
   before sending the real ``!REPLY``, so a single ``!PING?`` yields
   ``#PING?\\r!PONG\\r``. Echoes are discarded.
-* Replies do not carry a request id, so a reply is correlated to its command by
-  matching the command's leading token (see :func:`_expected_reply_prefix`). Any
-  ``!`` line that does not match the in-flight command is treated as an
-  unsolicited status push and dispatched to the event callback.
+* Only **query** commands get a ``!`` reply. A set command such as ``!VOL(15)``
+  is answered with the echo alone, so waiting for a reply to one blocks until the
+  timeout.
+* The device does **not** push state changes. An idle connection at verbosity 2
+  hears nothing when the volume is changed on another connection, so callers must
+  poll.
+
+Replies do not carry a request id, so a reply is correlated to its command by
+matching the command's leading token (see :func:`_expected_reply_prefix`). Any
+``!`` line that does not answer the in-flight command is handed to the event
+callback rather than mistaken for the reply -- which costs nothing today, and
+keeps the protocol correct on any model that does push.
 """
 
 import asyncio
@@ -32,7 +40,10 @@ _LOG = logging.getLogger(__name__)
 COMMAND_EOL = "\r"
 RESPONSE_EOL = "\r"
 ECHO_PREFIX = "#"
-REPLY_PREFIX = "!"
+
+# Only query commands produce a '!' reply; set commands are answered with the
+# echo alone.
+QUERY_SUFFIX = "?"
 
 DEFAULT_PORT = 84
 DEFAULT_TIMEOUT = 2.0
@@ -156,13 +167,22 @@ class McIntoshProtocol:
             raise McIntoshProtocolError("Not connected")
         await self._reader_task
 
-    async def send(self, command: str, wait_for_reply: bool = True) -> str | None:
+    async def send(
+        self, command: str, wait_for_reply: bool | None = None
+    ) -> str | None:
         """
         Send a command and return its reply, or None if no reply is expected.
+
+        Only query commands (``!VOL?``) get a ``!`` reply. The device answers a
+        set command (``!VOL(15)``) with the echo alone, so waiting on one would
+        block until the timeout.
 
         :raises McIntoshProtocolError: if the connection is not open.
         :raises TimeoutError: if no matching reply arrives within the timeout.
         """
+        if wait_for_reply is None:
+            wait_for_reply = command.endswith(QUERY_SUFFIX)
+
         if not self.is_connected:
             raise McIntoshProtocolError(f"Not connected to {self._host}:{self._port}")
 

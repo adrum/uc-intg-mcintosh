@@ -1,11 +1,14 @@
 """
 McIntosh A/V processor device, backed by a persistent TCP control connection.
 
-State is kept up to date from two sources that share one parser:
+The processor does not volunteer state changes: an idle connection at verbosity 2
+hears nothing when the volume is changed from elsewhere (verified against an
+MX160). State is therefore kept current by polling, plus an immediate re-read
+after each command we send so the UI does not lag by a poll cycle.
 
-* unsolicited messages the processor pushes when anything changes (front panel,
-  IR remote, another controller), giving near-instant updates, and
-* a slow poll that re-reads everything, as a safety net for any missed push.
+The reader still routes any message that is not a reply to the in-flight command
+into the same parser, so if a model or firmware does push, it is picked up for
+free -- and, more importantly, such a message can never be mistaken for a reply.
 """
 
 import asyncio
@@ -54,11 +57,17 @@ class McIntoshDevice(PersistentConnectionDevice):
         self._device_config: McIntoshConfig = device_config
         self._poll_interval = poll_interval
         self._protocol: McIntoshProtocol | None = None
+        self._label_task: asyncio.Task | None = None
 
         self._state: media_player.States = media_player.States.UNKNOWN
         self._volume: int = 0
         self._muted: bool = False
-        self._source: str = ""
+        self._source_id: int | None = None
+
+        # Source labels as named on the processor itself (e.g. source 7 is
+        # "Apple TV", not "HDMI 8"). Learned from the device; these are what the
+        # user sees, so the source list and the current source must agree on them.
+        self._labels: dict[int, str] = {}
 
     # -- Identity ------------------------------------------------------------
 
@@ -103,20 +112,30 @@ class McIntoshDevice(PersistentConnectionDevice):
 
     @property
     def source(self) -> str:
-        """Return the current source name."""
-        return self._source
+        """Return the current source name, as it appears in source_list."""
+        if self._source_id is None:
+            return ""
+        return self._source_name(self._source_id)
 
     @property
     def source_list(self) -> list[str]:
-        """Return the selectable source names, with any custom names applied."""
+        """Return the selectable source names."""
         return [self._source_name(source_id) for source_id in sorted(SOURCES)]
 
     def _source_name(self, source_id: int) -> str:
-        """Return the configured name for a source id, else the factory name."""
-        custom = self._device_config.sources.get(source_id)
-        return custom or SOURCES.get(source_id, f"Source {source_id}")
+        """
+        Return the name to show for a source id.
 
-    def _source_id(self, name: str) -> int | None:
+        Config override first, then the label the processor itself reports, then
+        the factory name.
+        """
+        return (
+            self._device_config.sources.get(source_id)
+            or self._labels.get(source_id)
+            or SOURCES.get(source_id, f"Source {source_id}")
+        )
+
+    def _lookup_source(self, name: str) -> int | None:
         """Return the source id for a source name, or None if unknown."""
         for source_id in SOURCES:
             if self._source_name(source_id) == name:
@@ -162,10 +181,54 @@ class McIntoshDevice(PersistentConnectionDevice):
         self._protocol = protocol
 
         await self._refresh()
+
+        # Reading all 26 source names costs ~10s at the protocol's command rate,
+        # so learn them in the background rather than holding up the entities.
+        # They do not change, so this runs once, not on every reconnect.
+        if not self._labels:
+            self._label_task = asyncio.create_task(self._learn_source_labels())
+
         return protocol
+
+    async def _learn_source_labels(self) -> None:
+        """
+        Read the name the user gave each input on the processor itself.
+
+        Without this the source list shows factory names ("HDMI 8") while the
+        device reports the user's label ("Apple TV"), so the current source would
+        not match any entry in the list.
+
+        The reply to ``!SRC(n)?`` looks exactly like a source-change message, so
+        it is parsed here rather than through the state parser, which would
+        otherwise read it as "the input just changed to n".
+        """
+        for source_id in sorted(SOURCES):
+            try:
+                reply = await self._protocol.send(f"!SRC({source_id})?")
+            except (McIntoshProtocolError, TimeoutError, AttributeError) as err:
+                _LOG.warning("[%s] Could not read source names: %s", self.log_id, err)
+                return
+
+            if not reply or not reply.startswith("!SRC("):
+                continue
+
+            label = reply.split(")", 1)[1].strip().strip('"')
+            if label:
+                self._labels[source_id] = label
+
+        _LOG.debug("[%s] Learned source names: %s", self.log_id, self._labels)
+        self.push_update()
 
     async def close_connection(self) -> None:
         """Close the control connection."""
+        if self._label_task and not self._label_task.done():
+            self._label_task.cancel()
+            try:
+                await self._label_task
+            except asyncio.CancelledError:
+                pass
+        self._label_task = None
+
         if self._protocol:
             await self._protocol.close()
             self._protocol = None
@@ -261,12 +324,17 @@ class McIntoshDevice(PersistentConnectionDevice):
         if message.startswith("!MUTE("):
             return self._set("_muted", _in_parens(message) == "1")
 
-        # e.g. !SRC(7)"Apple TV" -- prefer the processor's own label, which the
-        # user may have renamed on the unit itself.
+        # e.g. !SRC(7)"Apple TV" -- the trailing label is the name the user gave
+        # the input on the processor, so remember it for the source list.
         if message.startswith("!SRC("):
             source_id = int(_in_parens(message))
             label = message.split(")", 1)[1].strip().strip('"')
-            return self._set("_source", label or self._source_name(source_id))
+
+            learned = bool(label) and self._labels.get(source_id) != label
+            if learned:
+                self._labels[source_id] = label
+
+            return self._set("_source_id", source_id) or learned
 
         _LOG.debug("[%s] Ignoring message: %s", self.log_id, message)
         return False
@@ -280,11 +348,19 @@ class McIntoshDevice(PersistentConnectionDevice):
 
     # -- Commands ------------------------------------------------------------
 
-    async def _send(self, command: str, wait_for_reply: bool = True) -> str | None:
-        """Send a command, tolerating a dropped connection."""
+    async def _send(self, command: str) -> str | None:
+        """
+        Send a command and re-read the resulting state.
+
+        The processor does not announce what a command changed, so the refresh is
+        what makes the entity reflect it without waiting for the next poll.
+        """
         if self._protocol is None:
             raise McIntoshProtocolError(f"[{self.log_id}] Not connected")
-        return await self._protocol.send(command, wait_for_reply=wait_for_reply)
+
+        reply = await self._protocol.send(command)
+        await self._refresh()
+        return reply
 
     async def power_on(self) -> None:
         """Turn the processor on."""
@@ -320,7 +396,7 @@ class McIntoshDevice(PersistentConnectionDevice):
 
     async def select_source(self, name: str) -> None:
         """Select an input by name."""
-        source_id = self._source_id(name)
+        source_id = self._lookup_source(name)
         if source_id is None:
             raise ValueError(f"Unknown source: {name}")
         await self._send(f"!SRC({source_id})")

@@ -9,10 +9,11 @@ from ucapi.remote import States as RemoteStates
 
 DEFAULT_PORT: Final = 84
 
-# Poll interval used as a safety net behind the device's unsolicited pushes.
-# The processor announces state changes on its own at verbosity 2, so this only
-# needs to be slow enough to correct any missed event.
-DEFAULT_POLL_INTERVAL: Final = 60
+# The processor does not push state changes, so polling is the only way to notice
+# one made from the front panel, the IR remote, or another controller. State after
+# our own commands is refreshed immediately, so this only governs how quickly an
+# outside change is picked up.
+DEFAULT_POLL_INTERVAL: Final = 10
 
 
 @dataclass
