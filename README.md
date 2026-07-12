@@ -41,3 +41,23 @@ safety net.
 pip install -r requirements.txt
 UC_LOG_LEVEL=DEBUG python intg-mcintosh/driver.py
 ```
+
+## Tests
+
+```bash
+pip install -r requirements.txt -r test-requirements.txt
+pytest
+```
+
+The suite runs against `tests/fake_mcintosh.py`, a server that reproduces the
+protocol quirks listed above — including starting each connection at verbosity 0,
+answering set commands with the echo alone, and reporting mute as
+`!MUTEON`/`!MUTEOFF`. Each of those behaviours broke a real implementation before
+it was understood, so the fake exists to keep them from breaking one again.
+
+## Docker
+
+```bash
+docker build -t uc-intg-mcintosh .
+docker run -v $(pwd)/config:/config -p 9090:9090 uc-intg-mcintosh
+```

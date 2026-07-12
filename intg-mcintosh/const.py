@@ -9,6 +9,9 @@ from ucapi.remote import States as RemoteStates
 
 DEFAULT_PORT: Final = 84
 
+# The processor drops commands that arrive faster than this.
+MIN_TIME_BETWEEN_COMMANDS: Final = 0.4
+
 # The processor does not push state changes, so polling is the only way to notice
 # one made from the front panel, the IR remote, or another controller. State after
 # our own commands is refreshed immediately, so this only governs how quickly an

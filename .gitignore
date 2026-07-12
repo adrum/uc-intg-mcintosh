@@ -1,6 +1,14 @@
 __pycache__/
 *.py[cod]
+*.spec
+
 .venv/
 venv/
+
+build/
+dist/
+artifacts/
+
+.pytest_cache/
 config.json
 .DS_Store

@@ -18,6 +18,7 @@ from asyncio import AbstractEventLoop
 from const import (
     DEFAULT_POLL_INTERVAL,
     MAX_VOLUME,
+    MIN_TIME_BETWEEN_COMMANDS,
     SOURCES,
     McIntoshConfig,
 )
@@ -49,6 +50,7 @@ class McIntoshDevice(PersistentConnectionDevice):
         config_manager=None,
         driver: BaseIntegrationDriver | None = None,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
+        command_interval: float = MIN_TIME_BETWEEN_COMMANDS,
     ) -> None:
         """Create instance."""
         super().__init__(
@@ -56,6 +58,7 @@ class McIntoshDevice(PersistentConnectionDevice):
         )
         self._device_config: McIntoshConfig = device_config
         self._poll_interval = poll_interval
+        self._command_interval = command_interval
         self._protocol: McIntoshProtocol | None = None
         self._label_task: asyncio.Task | None = None
 
@@ -67,7 +70,10 @@ class McIntoshDevice(PersistentConnectionDevice):
         # Source labels as named on the processor itself (e.g. source 7 is
         # "Apple TV", not "HDMI 8"). Learned from the device; these are what the
         # user sees, so the source list and the current source must agree on them.
+        # Polling learns the current input's label as a side effect, so a separate
+        # flag -- not an empty dict -- tracks whether the full sweep has run.
         self._labels: dict[int, str] = {}
+        self._labels_learned = False
 
     # -- Identity ------------------------------------------------------------
 
@@ -154,7 +160,7 @@ class McIntoshDevice(PersistentConnectionDevice):
             STATE=self._state,
             VOLUME=self._volume,
             MUTED=self._muted,
-            SOURCE=self._source,
+            SOURCE=self.source,
             SOURCE_LIST=self.source_list,
         )
 
@@ -176,6 +182,7 @@ class McIntoshDevice(PersistentConnectionDevice):
             self._device_config.address,
             self._device_config.port,
             on_event=self._handle_message,
+            min_time_between_commands=self._command_interval,
         )
         await protocol.connect()
         self._protocol = protocol
@@ -185,7 +192,7 @@ class McIntoshDevice(PersistentConnectionDevice):
         # Reading all 26 source names costs ~10s at the protocol's command rate,
         # so learn them in the background rather than holding up the entities.
         # They do not change, so this runs once, not on every reconnect.
-        if not self._labels:
+        if not self._labels_learned:
             self._label_task = asyncio.create_task(self._learn_source_labels())
 
         return protocol
@@ -216,6 +223,7 @@ class McIntoshDevice(PersistentConnectionDevice):
             if label:
                 self._labels[source_id] = label
 
+        self._labels_learned = True
         _LOG.debug("[%s] Learned source names: %s", self.log_id, self._labels)
         self.push_update()
 
