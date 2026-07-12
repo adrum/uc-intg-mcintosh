@@ -1,0 +1,11 @@
+[project]
+name = "uc-intg-mcintosh"
+version = "0.1.0"
+description = "An Unfolded Circle integration for McIntosh A/V processors"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyee>=9.0.0",
+    "ucapi==0.7.0",
+    "ucapi-framework==1.9.5",
+]

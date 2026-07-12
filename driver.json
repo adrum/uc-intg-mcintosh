@@ -1,0 +1,37 @@
+{
+  "driver_id": "mcintosh_driver",
+  "version": "0.1.0",
+  "min_core_api": "0.20.0",
+  "name": { "en": "McIntosh" },
+  "icon": "uc:display",
+  "description": {
+    "en": "Control your McIntosh A/V processor with Remote Two/3."
+  },
+  "developer": {
+    "name": "Austin Drummond",
+    "email": "adrummond7@gmail.com",
+    "url": "https://github.com/adrum"
+  },
+  "home_page": "https://github.com/adrum/uc-intg-mcintosh",
+  "setup_data_schema": {
+    "title": {
+      "en": "Integration setup"
+    },
+    "settings": [
+      {
+        "id": "info",
+        "label": {
+          "en": "Setup process"
+        },
+        "field": {
+          "label": {
+            "value": {
+              "en": "This integration controls McIntosh MX-series A/V processors (MX160, MX170, MX180) over IP. Control over IP must be enabled on the processor."
+            }
+          }
+        }
+      }
+    ]
+  },
+  "release_date": "2026-07-12"
+}
