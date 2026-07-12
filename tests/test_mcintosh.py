@@ -1,5 +1,7 @@
 """Device tests: state parsing, source naming, and commands."""
 
+import asyncio
+
 import pytest
 import pytest_asyncio
 from const import McIntoshConfig
@@ -55,8 +57,11 @@ async def test_source_uses_the_label_set_on_the_processor(device):
 async def test_select_source_by_visible_name(device, fake):
     """Selecting the name shown in the list reaches the right input."""
     await device.select_source("Blu-ray")
+
+    assert device.source == "Blu-ray"  # shown immediately, before the wire settles
+
+    await asyncio.sleep(0.05)
     assert fake.source == 0
-    assert device.source == "Blu-ray"
 
 
 async def test_select_unknown_source_is_rejected(device):
@@ -65,24 +70,84 @@ async def test_select_unknown_source_is_rejected(device):
         await device.select_source("Betamax")
 
 
-async def test_commands_reach_the_device_and_refresh_state(device, fake):
-    """
-    A command updates the entity without waiting for the next poll.
-
-    The processor never announces what a command changed, so the device re-reads
-    its state after each one.
-    """
+async def test_commands_reach_the_device(device, fake):
+    """Commands are actually written to the processor."""
     await device.power_off()
+    await asyncio.sleep(0.05)
     assert fake.power is False
-    assert device.state == media_player.States.OFF
 
     await device.set_volume(42)
+    await asyncio.sleep(0.05)
     assert fake.volume == 42
-    assert device.volume == 42
 
     await device.set_mute(True)
+    await asyncio.sleep(0.05)
     assert fake.muted is True
-    assert device.muted is True
+
+
+async def test_entity_updates_before_the_command_is_sent(device):
+    """
+    A button press moves the entity immediately, without waiting on the wire.
+
+    The processor acknowledges a set command with nothing but an echo, so it never
+    reports what changed. If the entity waited for a re-read, every press would
+    cost five commands at the protocol's spacing -- about two seconds before the
+    remote showed anything.
+    """
+    pushes = []
+    original = device.push_update
+    device.push_update = lambda: (pushes.append(device.volume), original())[1]
+
+    start = device.volume
+    step = device._device_config.volume_step
+
+    await device.volume_down()
+
+    assert pushes and pushes[0] == start - step, "volume did not update optimistically"
+    assert device.volume == start - step
+
+
+async def test_optimistic_volume_is_clamped(device):
+    """An optimistic guess never leaves the processor's 0-99 scale."""
+    device._volume = 0
+    await device.volume_down()
+    assert device.volume == 0
+
+    device._volume = 99
+    await device.volume_up()
+    assert device.volume == 99
+
+
+async def test_reconcile_corrects_a_wrong_guess(device, fake):
+    """
+    The guess is only a guess; the device gets the last word.
+
+    If the processor ignored or clamped the command, the reconcile that follows
+    the burst pulls the entity back to the truth.
+    """
+    device._volume = 28
+
+    # The processor disagrees: it is really at 11.
+    fake.volume = 11
+    device._expect(_volume=99)
+    assert device.volume == 99
+
+    device._schedule_reconcile()
+    await device._reconcile_task
+
+    assert device.volume == 11, "reconcile did not correct the optimistic guess"
+
+
+async def test_a_burst_of_presses_reconciles_once(device, fake):
+    """Holding a button must not fire a state re-read per press."""
+    for _ in range(4):
+        await device.volume_down()
+
+    task = device._reconcile_task
+    assert task is not None and not task.done()
+
+    await task
+    assert device.volume == fake.volume
 
 
 async def test_mute_parses_muteon_muteoff(device, fake):

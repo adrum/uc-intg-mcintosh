@@ -3,8 +3,16 @@ McIntosh A/V processor device, backed by a persistent TCP control connection.
 
 The processor does not volunteer state changes: an idle connection at verbosity 2
 hears nothing when the volume is changed from elsewhere (verified against an
-MX160). State is therefore kept current by polling, plus an immediate re-read
-after each command we send so the UI does not lag by a poll cycle.
+MX160). Nor does it report what one of our own commands changed -- a set command
+is acknowledged with nothing but an echo.
+
+State is therefore kept current three ways:
+
+* commands apply their expected result locally and push it straight away, so the
+  remote reacts to a button press immediately rather than waiting on the wire,
+* a reconcile re-reads the device shortly after the last command in a burst,
+  correcting the guess if the processor disagreed, and
+* a slow poll notices changes made from the front panel or another controller.
 
 The reader still routes any message that is not a reply to the in-flight command
 into the same parser, so if a model or firmware does push, it is picked up for
@@ -19,6 +27,7 @@ from const import (
     DEFAULT_POLL_INTERVAL,
     MAX_VOLUME,
     MIN_TIME_BETWEEN_COMMANDS,
+    RECONCILE_DELAY,
     SOURCES,
     McIntoshConfig,
 )
@@ -33,6 +42,11 @@ _LOG = logging.getLogger(__name__)
 def _in_parens(message: str) -> str:
     """Return the argument of a message like ``!VOL(28)`` -> ``28``."""
     return message.split("(", 1)[1].split(")", 1)[0]
+
+
+def _clamp(volume: int) -> int:
+    """Hold a volume inside the processor's 0-99 scale."""
+    return max(0, min(MAX_VOLUME, volume))
 
 
 # Queried on every poll. Each reply is fed through the same parser as the
@@ -61,6 +75,7 @@ class McIntoshDevice(PersistentConnectionDevice):
         self._command_interval = command_interval
         self._protocol: McIntoshProtocol | None = None
         self._label_task: asyncio.Task | None = None
+        self._reconcile_task: asyncio.Task | None = None
 
         self._state: media_player.States = media_player.States.UNKNOWN
         self._volume: int = 0
@@ -229,13 +244,16 @@ class McIntoshDevice(PersistentConnectionDevice):
 
     async def close_connection(self) -> None:
         """Close the control connection."""
-        if self._label_task and not self._label_task.done():
-            self._label_task.cancel()
-            try:
-                await self._label_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._label_task, self._reconcile_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         self._label_task = None
+        self._reconcile_task = None
 
         if self._protocol:
             await self._protocol.close()
@@ -358,48 +376,94 @@ class McIntoshDevice(PersistentConnectionDevice):
 
     async def _send(self, command: str) -> str | None:
         """
-        Send a command and re-read the resulting state.
+        Write a command and schedule a reconcile, without waiting for one.
 
-        The processor does not announce what a command changed, so the refresh is
-        what makes the entity reflect it without waiting for the next poll.
+        Re-reading state inline would make every button press cost five commands
+        at the protocol's 0.4s spacing -- about two seconds before the remote even
+        gets an acknowledgement. Callers instead apply the expected result to the
+        local state up front (see _expect), so the UI moves immediately, and the
+        reconcile that follows corrects it if the processor disagreed.
         """
         if self._protocol is None:
             raise McIntoshProtocolError(f"[{self.log_id}] Not connected")
 
-        reply = await self._protocol.send(command)
-        await self._refresh()
-        return reply
+        try:
+            return await self._protocol.send(command)
+        finally:
+            self._schedule_reconcile()
+
+    def _expect(self, **changes) -> None:
+        """
+        Apply the expected result of a command and show it immediately.
+
+        The processor acknowledges a set command with nothing but an echo, so it
+        never reports what changed; without this the entity would not move until
+        the reconcile lands.
+        """
+        if any(self._set(attr, value) for attr, value in changes.items()):
+            self.push_update()
+
+    def _schedule_reconcile(self) -> None:
+        """Re-read state shortly after the last command in a burst."""
+        if self._reconcile_task and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+
+        self._reconcile_task = asyncio.create_task(self._reconcile())
+
+    async def _reconcile(self) -> None:
+        """Wait out a burst of commands, then confirm the real device state."""
+        try:
+            await asyncio.sleep(RECONCILE_DELAY)
+            await self._refresh()
+        except asyncio.CancelledError:
+            raise
+        except (McIntoshProtocolError, TimeoutError) as err:
+            _LOG.warning("[%s] Reconcile failed: %s", self.log_id, err)
 
     async def power_on(self) -> None:
         """Turn the processor on."""
+        self._expect(_state=media_player.States.ON)
         await self._send("!PON")
 
     async def power_off(self) -> None:
         """Turn the processor off."""
+        self._expect(_state=media_player.States.OFF)
         await self._send("!POFF")
 
     async def power_toggle(self) -> None:
         """Toggle power."""
+        on = self._state == media_player.States.ON
+        self._expect(
+            _state=media_player.States.OFF if on else media_player.States.ON
+        )
         await self._send("!PTOGGLE")
 
     async def set_volume(self, level: int) -> None:
         """Set the volume (0-99)."""
-        await self._send(f"!VOL({max(0, min(MAX_VOLUME, int(level)))})")
+        level = _clamp(int(level))
+        self._expect(_volume=level)
+        await self._send(f"!VOL({level})")
 
     async def volume_up(self) -> None:
         """Raise the volume by the configured step."""
-        await self._send(f"!VOL+({self._device_config.volume_step})")
+        step = self._device_config.volume_step
+        self._expect(_volume=_clamp(self._volume + step))
+        await self._send(f"!VOL+({step})")
 
     async def volume_down(self) -> None:
         """Lower the volume by the configured step."""
-        await self._send(f"!VOL-({self._device_config.volume_step})")
+        step = self._device_config.volume_step
+        self._expect(_volume=_clamp(self._volume - step))
+        await self._send(f"!VOL-({step})")
 
     async def mute_toggle(self) -> None:
         """Toggle mute."""
+        self._expect(_muted=not self._muted)
         await self._send("!MUTE")
 
     async def set_mute(self, muted: bool) -> None:
         """Set mute on or off."""
+        self._expect(_muted=muted)
         await self._send("!MUTEON" if muted else "!MUTEOFF")
 
     async def select_source(self, name: str) -> None:
@@ -407,6 +471,8 @@ class McIntoshDevice(PersistentConnectionDevice):
         source_id = self._lookup_source(name)
         if source_id is None:
             raise ValueError(f"Unknown source: {name}")
+
+        self._expect(_source_id=source_id)
         await self._send(f"!SRC({source_id})")
 
     async def send_raw(self, command: str) -> str | None:

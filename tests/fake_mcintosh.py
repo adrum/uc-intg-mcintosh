@@ -123,6 +123,12 @@ class FakeMcIntosh:
         if command.startswith("!VOL(") and command.endswith(")"):
             self.volume = int(command[5:-1])
             return None
+        if command.startswith("!VOL+(") and command.endswith(")"):
+            self.volume = min(99, self.volume + int(command[6:-1]))
+            return None
+        if command.startswith("!VOL-(") and command.endswith(")"):
+            self.volume = max(0, self.volume - int(command[6:-1]))
+            return None
         if command.startswith("!SRC(") and command.endswith(")"):
             self.source = int(command[5:-1])
             return None
