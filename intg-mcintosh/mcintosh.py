@@ -6,13 +6,14 @@ hears nothing when the volume is changed from elsewhere (verified against an
 MX160). Nor does it report what one of our own commands changed -- a set command
 is acknowledged with nothing but an echo.
 
-State is therefore kept current three ways:
+State is therefore kept current two ways:
 
 * commands apply their expected result locally and push it straight away, so the
-  remote reacts to a button press immediately rather than waiting on the wire,
-* a reconcile re-reads the device shortly after the last command in a burst,
-  correcting the guess if the processor disagreed, and
-* a slow poll notices changes made from the front panel or another controller.
+  remote reacts to a button press immediately rather than waiting on the wire
+  (fire and forget -- we do not re-read after each command, which would make a
+  burst of volume presses queue behind a four-query state read), and
+* a slow poll notices changes made from the front panel or another controller,
+  and corrects an optimistic guess the processor clamped or ignored.
 
 The reader still routes any message that is not a reply to the in-flight command
 into the same parser, so if a model or firmware does push, it is picked up for
@@ -27,7 +28,6 @@ from const import (
     DEFAULT_POLL_INTERVAL,
     MAX_VOLUME,
     MIN_TIME_BETWEEN_COMMANDS,
-    RECONCILE_DELAY,
     SOURCES,
     McIntoshConfig,
 )
@@ -75,7 +75,6 @@ class McIntoshDevice(PersistentConnectionDevice):
         self._command_interval = command_interval
         self._protocol: McIntoshProtocol | None = None
         self._label_task: asyncio.Task | None = None
-        self._reconcile_task: asyncio.Task | None = None
 
         self._state: media_player.States = media_player.States.UNKNOWN
         self._volume: int = 0
@@ -244,16 +243,14 @@ class McIntoshDevice(PersistentConnectionDevice):
 
     async def close_connection(self) -> None:
         """Close the control connection."""
-        for task in (self._label_task, self._reconcile_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        if self._label_task and not self._label_task.done():
+            self._label_task.cancel()
+            try:
+                await self._label_task
+            except asyncio.CancelledError:
+                pass
 
         self._label_task = None
-        self._reconcile_task = None
 
         if self._protocol:
             await self._protocol.close()
@@ -376,21 +373,20 @@ class McIntoshDevice(PersistentConnectionDevice):
 
     async def _send(self, command: str) -> str | None:
         """
-        Write a command and schedule a reconcile, without waiting for one.
+        Write a command without reading state back (fire and forget).
 
-        Re-reading state inline would make every button press cost five commands
-        at the protocol's 0.4s spacing -- about two seconds before the remote even
-        gets an acknowledgement. Callers instead apply the expected result to the
-        local state up front (see _expect), so the UI moves immediately, and the
-        reconcile that follows corrects it if the processor disagreed.
+        Set commands are answered with nothing but an echo, so there is nothing
+        to wait for. Callers apply the expected result to the local state up
+        front (see _expect), so the UI moves immediately; the periodic poll
+        (_poll_loop) is the safety net that corrects the state if the processor
+        disagreed or was changed from the front panel. We deliberately do NOT
+        re-poll after every command: doing so made a burst of volume presses
+        queue behind a four-query state read, stalling each press for seconds.
         """
         if self._protocol is None:
             raise McIntoshProtocolError(f"[{self.log_id}] Not connected")
 
-        try:
-            return await self._protocol.send(command)
-        finally:
-            self._schedule_reconcile()
+        return await self._protocol.send(command)
 
     def _expect(self, **changes) -> None:
         """
@@ -398,27 +394,10 @@ class McIntoshDevice(PersistentConnectionDevice):
 
         The processor acknowledges a set command with nothing but an echo, so it
         never reports what changed; without this the entity would not move until
-        the reconcile lands.
+        the next poll.
         """
         if any(self._set(attr, value) for attr, value in changes.items()):
             self.push_update()
-
-    def _schedule_reconcile(self) -> None:
-        """Re-read state shortly after the last command in a burst."""
-        if self._reconcile_task and not self._reconcile_task.done():
-            self._reconcile_task.cancel()
-
-        self._reconcile_task = asyncio.create_task(self._reconcile())
-
-    async def _reconcile(self) -> None:
-        """Wait out a burst of commands, then confirm the real device state."""
-        try:
-            await asyncio.sleep(RECONCILE_DELAY)
-            await self._refresh()
-        except asyncio.CancelledError:
-            raise
-        except (McIntoshProtocolError, TimeoutError) as err:
-            _LOG.warning("[%s] Reconcile failed: %s", self.log_id, err)
 
     async def power_on(self) -> None:
         """Turn the processor on."""

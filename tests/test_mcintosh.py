@@ -118,12 +118,12 @@ async def test_optimistic_volume_is_clamped(device):
     assert device.volume == 99
 
 
-async def test_reconcile_corrects_a_wrong_guess(device, fake):
+async def test_poll_corrects_a_wrong_guess(device, fake):
     """
     The guess is only a guess; the device gets the last word.
 
-    If the processor ignored or clamped the command, the reconcile that follows
-    the burst pulls the entity back to the truth.
+    If the processor ignored or clamped the command, the next periodic poll
+    pulls the entity back to the truth.
     """
     device._volume = 28
 
@@ -132,22 +132,24 @@ async def test_reconcile_corrects_a_wrong_guess(device, fake):
     device._expect(_volume=99)
     assert device.volume == 99
 
-    device._schedule_reconcile()
-    await device._reconcile_task
+    await device._refresh()
 
-    assert device.volume == 11, "reconcile did not correct the optimistic guess"
+    assert device.volume == 11, "poll did not correct the optimistic guess"
 
 
-async def test_a_burst_of_presses_reconciles_once(device, fake):
-    """Holding a button must not fire a state re-read per press."""
+async def test_a_burst_of_presses_does_not_re_read(device, fake):
+    """
+    Fire and forget: each press sends only its set command, with no per-press
+    state re-read for the next press to stall behind.
+    """
+    step = device._device_config.volume_step
+    fake.received.clear()
+
     for _ in range(4):
         await device.volume_down()
 
-    task = device._reconcile_task
-    assert task is not None and not task.done()
-
-    await task
-    assert device.volume == fake.volume
+    await asyncio.sleep(0.05)
+    assert fake.received == [f"!VOL-({step})"] * 4
 
 
 async def test_mute_parses_muteon_muteoff(device, fake):

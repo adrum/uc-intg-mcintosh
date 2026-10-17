@@ -12,14 +12,12 @@ DEFAULT_PORT: Final = 84
 # The processor drops commands that arrive faster than this.
 MIN_TIME_BETWEEN_COMMANDS: Final = 0.4
 
-# How long to wait after the last command in a burst before re-reading state.
-# Long enough that holding a volume button does not trigger a refresh per press.
-RECONCILE_DELAY: Final = 1.0
-
-# The processor does not push state changes, so polling is the only way to notice
-# one made from the front panel, the IR remote, or another controller. State after
-# our own commands is refreshed immediately, so this only governs how quickly an
-# outside change is picked up.
+# The processor does not push state changes and we deliberately do not re-read
+# after our own commands (that stalled rapid button presses), so this periodic
+# poll is the only thing that notices a change made from the front panel, the IR
+# remote, or another controller -- and corrects an optimistic guess the processor
+# clamped. Commands move the entity immediately via _expect; this governs how
+# quickly reality is reconciled.
 DEFAULT_POLL_INTERVAL: Final = 10
 
 
