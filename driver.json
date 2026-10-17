@@ -1,8 +1,10 @@
 {
   "driver_id": "mcintosh_driver",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "min_core_api": "0.20.0",
-  "name": { "en": "McIntosh" },
+  "name": {
+    "en": "McIntosh"
+  },
   "icon": "uc:display",
   "description": {
     "en": "Control your McIntosh A/V processor with Remote Two/3."
